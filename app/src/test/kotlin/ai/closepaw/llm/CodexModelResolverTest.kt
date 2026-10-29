@@ -63,7 +63,7 @@ class CodexModelResolverTest {
 
     @Test fun `supported in api false remains eligible for ChatGPT OAuth`() = runBlocking {
         server.enqueue(MockResponse().setBody("""{"models":[{"slug":"oauth-only","visibility":"list","supported_in_api":false}]}"""))
-        assertThat(resolver().listModels(headers, true).map { it.slug }).containsExactly("oauth-only")
+        assertThat(resolver().listModels(headers, true).map { it.slug }).containsExactly("oauth-only").inOrder()
     }
 
     @Test fun `priority and capability metadata are preserved`() = runBlocking {
