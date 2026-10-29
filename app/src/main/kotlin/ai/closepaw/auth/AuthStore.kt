@@ -107,7 +107,7 @@ class AuthStore(
             throw WrongCredentialType(provider, expected = "OAuth", actual = "ApiKey")
         }
         if (!isExpiringSoon(current)) {
-            return current.toHeaders()
+            return current.toHeaders().requireCodexAccount(provider)
         }
 
         return refreshMutex.withLock {
@@ -117,25 +117,36 @@ class AuthStore(
                 throw WrongCredentialType(provider, expected = "OAuth", actual = "ApiKey")
             }
             if (!isExpiringSoon(latest)) {
-                return@withLock latest.toHeaders()
+                return@withLock latest.toHeaders().requireCodexAccount(provider)
+            }
+            if (provider == LLMProvider.OPENAI_CODEX && latest.refreshToken.isBlank()) {
+                throw OAuthRefreshFailed(
+                    provider,
+                    IllegalStateException("Saved ChatGPT sign-in cannot be refreshed. Sign out, then sign in again."),
+                )
             }
             val refreshed = try {
                 refresher(latest.refreshToken)
             } catch (t: Throwable) {
                 throw OAuthRefreshFailed(provider, t)
             }
+            val rotated = refreshed.copy(
+                refreshToken = refreshed.refreshToken.ifBlank { latest.refreshToken },
+                idToken = refreshed.idToken ?: latest.idToken,
+                email = refreshed.email ?: latest.email,
+            )
             // If set/clear ran concurrently during the refresh network call, do NOT
             // clobber the caller's write. Yield to whatever they committed.
             if (generation(provider) == genBefore) {
-                write(provider.name, refreshed)
+                write(provider.name, rotated)
                 bump(provider.name)
-                refreshed.toHeaders()
+                rotated.toHeaders().requireCodexAccount(provider)
             } else {
                 val now = read(provider.name) ?: throw MissingCredential(provider)
                 if (now !is AuthCredential.OAuth) {
                     throw WrongCredentialType(provider, expected = "OAuth", actual = "ApiKey")
                 }
-                now.toHeaders()
+                now.toHeaders().requireCodexAccount(provider)
             }
         }
     }
@@ -145,9 +156,20 @@ class AuthStore(
 
     private fun AuthCredential.OAuth.toHeaders(): CodexHeaders = CodexHeaders(
         accessToken = accessToken,
-        chatgptAccountId = idToken?.let(::parseChatgptAccountId),
+        chatgptAccountId = idToken?.let(::parseChatgptAccountId)
+            ?: parseChatgptAccountId(accessToken),
         email = email,
     )
+
+    private fun CodexHeaders.requireCodexAccount(provider: LLMProvider): CodexHeaders {
+        if (provider == LLMProvider.OPENAI_CODEX && chatgptAccountId == null) {
+            throw OAuthRefreshFailed(
+                provider,
+                IllegalStateException("Saved ChatGPT sign-in is outdated. Sign out, then sign in again."),
+            )
+        }
+        return this
+    }
 
     private fun bump(key: String) {
         generations.computeIfAbsent(key) { AtomicLong(0L) }.incrementAndGet()
@@ -157,8 +179,8 @@ class AuthStore(
         val raw = prefs().getString(key, null) ?: return null
         return try {
             json.decodeFromString<StoredCredential>(raw).toDomain()
-        } catch (e: Exception) {
-            Log.w(TAG, "Failed to parse $key: ${e.message}")
+        } catch (_: Exception) {
+            Log.w(TAG, "Failed to parse saved credential for $key")
             null
         }
     }
@@ -210,13 +232,16 @@ class AuthStore(
  * Best-effort extraction of the `chatgpt_account_id` claim from a JWT payload.
  * Returns null if the token is malformed or the claim is absent.
  */
-private fun parseChatgptAccountId(idToken: String): String? {
-    val parts = idToken.split('.')
+private fun parseChatgptAccountId(token: String): String? {
+    val parts = token.split('.')
     if (parts.size < 2) return null
     return try {
         val payload = java.util.Base64.getUrlDecoder().decode(padBase64(parts[1]))
-        val json = String(payload, Charsets.UTF_8)
-        Regex("\"chatgpt_account_id\"\\s*:\\s*\"([^\"]+)\"").find(json)?.groupValues?.get(1)
+        val json = org.json.JSONObject(String(payload, Charsets.UTF_8))
+        json.optString("chatgpt_account_id", "").ifBlank {
+            json.optJSONObject("https://api.openai.com/auth")
+                ?.optString("chatgpt_account_id", "").orEmpty()
+        }.ifBlank { null }
     } catch (_: Exception) {
         null
     }

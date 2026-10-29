@@ -20,11 +20,13 @@ internal object CodexRequestBuilder {
 
     private const val TAG = "CodexRequestBuilder"
 
+    @JvmOverloads
     fun buildRequestBody(
         systemPrompt: String,
         inputItems: List<ResponseInputItem>,
         tools: List<FunctionTool>,
-        model: String
+        model: String,
+        supportsParallelToolCalls: Boolean = true,
     ): String {
         val body = JSONObject().apply {
             put("model", model)
@@ -33,7 +35,7 @@ internal object CodexRequestBuilder {
             put("instructions", systemPrompt)
             put("input", convertInputItems(inputItems))
             put("tool_choice", "auto")
-            put("parallel_tool_calls", true)
+            put("parallel_tool_calls", supportsParallelToolCalls)
             put("tools", convertTools(tools))
         }
         return body.toString()

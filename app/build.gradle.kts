@@ -234,7 +234,8 @@ dependencies {
     // Conscrypt — bundled (vs reflection on platform) for the TLS exporter API used by the
     // ADB pairing handshake. Platform Conscrypt is hidden API and HiddenApiBypass falls flat
     // on certain Android builds; the bundled AAR (~3MB) gives us a stable Conscrypt.exportKeyingMaterial.
-    implementation("org.conscrypt:conscrypt-android:2.5.2")
+    // 2.5.3 preserves the TLS exporter API and adds 16 KB native page alignment.
+    implementation("org.conscrypt:conscrypt-android:2.5.3")
 
     // Testing
     testImplementation("junit:junit:4.13.2")

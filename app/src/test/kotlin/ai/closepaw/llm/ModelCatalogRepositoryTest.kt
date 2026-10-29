@@ -15,6 +15,12 @@ import io.mockk.mockkConstructor
 import io.mockk.unmockkConstructor
 import java.io.ByteArrayInputStream
 import java.io.File
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.async
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Test
@@ -41,6 +47,48 @@ class ModelCatalogRepositoryTest {
         val expectedKeys = ModelCatalog.fromJson(String(seedBytes)).names()
         assertThat(catalog.names()).isEqualTo(expectedKeys)
         assertThat(catalog.size).isEqualTo(expectedKeys.size)
+    }
+
+    @Test
+    fun `signout during Codex refresh discards late account models`() = runBlocking {
+        val server = okhttp3.mockwebserver.MockWebServer().also { it.start() }
+        val requestStarted = CountDownLatch(1)
+        val releaseRequest = CountDownLatch(1)
+        try {
+            server.enqueue(okhttp3.mockwebserver.MockResponse().setBody(
+                """{"models":[{"slug":"wrong-account","visibility":"list"}]}"""
+            ))
+            val client = okhttp3.OkHttpClient.Builder().addInterceptor { chain ->
+                requestStarted.countDown()
+                check(releaseRequest.await(5, TimeUnit.SECONDS))
+                chain.proceed(chain.request())
+            }.build()
+            val resolver = CodexModelResolver(
+                httpClient = client,
+                modelsUrl = server.url("/backend-api/codex/models").toString().removeSuffix("/"),
+            )
+            val repo = ModelCatalogRepository(
+                context = contextReturningAsset(seedBytes()),
+                settingsStore = fakeSettingsStore(otherBaseUrl = "", otherModelId = ""),
+                discoveryCache = mockk(relaxed = true),
+                codexResolver = resolver,
+            )
+            val refresh = async(Dispatchers.IO) {
+                repo.refreshCodex(ai.closepaw.auth.CodexHeaders("token", "account", null))
+            }
+            assertThat(requestStarted.await(5, TimeUnit.SECONDS)).isTrue()
+            val clear = async(start = CoroutineStart.UNDISPATCHED) { repo.clearCodexModels() }
+            releaseRequest.countDown()
+            clear.await()
+            refresh.await()
+
+            assertThat(repo.catalog.value.names().none {
+                it.startsWith(CodexModelResolver.CATALOG_PREFIX)
+            }).isTrue()
+        } finally {
+            releaseRequest.countDown()
+            server.shutdown()
+        }
     }
 
     @Test

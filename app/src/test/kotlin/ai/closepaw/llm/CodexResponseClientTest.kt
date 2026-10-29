@@ -5,6 +5,10 @@ import com.google.common.truth.Truth.assertThat
 import com.openai.models.responses.FunctionTool
 import com.openai.models.responses.ResponseInputItem
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.flow.toList
+import okhttp3.OkHttpClient
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Protocol
 import okhttp3.Request
@@ -44,7 +48,8 @@ class CodexResponseClientTest {
         assertThat(request.method).isEqualTo("POST")
         assertThat(request.header("Authorization")).isEqualTo("Bearer ${headers.accessToken}")
         assertThat(request.header("chatgpt-account-id")).isEqualTo(headers.chatgptAccountId)
-        assertThat(request.header("originator")).isEqualTo("pi")
+        assertThat(request.header("originator")).isEqualTo("closepaw")
+        assertThat(request.header("version")).isEqualTo("0.165.0")
         assertThat(request.header("OpenAI-Beta")).isEqualTo("responses=experimental")
         assertThat(request.header("Accept")).isEqualTo("text/event-stream")
         assertThat(request.header("Content-Type")).isEqualTo("application/json")
@@ -55,7 +60,7 @@ class CodexResponseClientTest {
     @Test
     fun `buildRequest omits account id header when supplier returns null`() {
         val noAccount = headers.copy(chatgptAccountId = null)
-        val client = CodexResponseClient { noAccount }
+        val client = CodexResponseClient(headerSupplier = { noAccount })
         val request = invokeBuildRequest(client, "{}", noAccount)
         assertThat(request.header("chatgpt-account-id")).isNull()
     }
@@ -95,6 +100,64 @@ class CodexResponseClientTest {
         assertThat(json.getString("tool_choice")).isEqualTo("auto")
         assertThat(json.getBoolean("parallel_tool_calls")).isTrue()
         assertThat(json.has("max_output_tokens")).isFalse()
+    }
+
+    @Test fun `nonstreaming request replaces retired saved model in payload`() = runBlocking {
+        val server = MockWebServer().also { it.start() }
+        try {
+            server.enqueue(MockResponse().setBody("""{"models":[{"slug":"available","display_name":"Available","visibility":"list","supported_in_api":true}]}"""))
+            server.enqueue(MockResponse().setHeader("Content-Type", "text/event-stream").setBody(completedSse()))
+            val client = testClient(server)
+            val result = client.chatWithTools("system", emptyList(), emptyList(), "retired", null)
+            assertThat(result.responseId).isEqualTo("r1")
+            assertThat(result.toolCalls).isEmpty()
+            server.takeRequest() // catalog
+            assertThat(JSONObject(server.takeRequest().body.readUtf8()).getString("model")).isEqualTo("available")
+        } finally { server.shutdown() }
+    }
+
+    @Test fun `streaming request replaces retired saved model in payload`() = runBlocking {
+        val server = MockWebServer().also { it.start() }
+        try {
+            server.enqueue(MockResponse().setBody("""{"models":[{"slug":"available","display_name":"Available","visibility":"list","supported_in_api":true}]}"""))
+            server.enqueue(MockResponse().setHeader("Content-Type", "text/event-stream").setBody(completedSse()))
+            testClient(server).chatWithToolsStreaming("system", emptyList(), emptyList(), "retired").toList()
+            server.takeRequest()
+            assertThat(JSONObject(server.takeRequest().body.readUtf8()).getString("model")).isEqualTo("available")
+        } finally { server.shutdown() }
+    }
+
+    @Test fun `unsupported model 400 refreshes and retries exactly once`() = runBlocking {
+        val server = MockWebServer().also { it.start() }
+        try {
+            server.enqueue(MockResponse().setBody("""{"models":[{"slug":"old","visibility":"list"}]}"""))
+            server.enqueue(MockResponse().setResponseCode(400).setBody("""{"error":{"code":"unsupported_model","message":"model unsupported"}}"""))
+            server.enqueue(MockResponse().setBody("""{"models":[{"slug":"new","visibility":"list"}]}"""))
+            server.enqueue(MockResponse().setHeader("Content-Type", "text/event-stream").setBody(completedSse()))
+
+            testClient(server).chatWithTools("system", emptyList(), emptyList(), "old", null)
+
+            assertThat(server.requestCount).isEqualTo(4)
+            server.takeRequest()
+            assertThat(JSONObject(server.takeRequest().body.readUtf8()).getString("model")).isEqualTo("old")
+            server.takeRequest()
+            assertThat(JSONObject(server.takeRequest().body.readUtf8()).getString("model")).isEqualTo("new")
+        } finally { server.shutdown() }
+    }
+
+    @Test fun `nonstreaming incomplete response reads incomplete details reason`() = runBlocking {
+        val server = MockWebServer().also { it.start() }
+        try {
+            server.enqueue(MockResponse().setBody("""{"models":[{"slug":"available","visibility":"list"}]}"""))
+            server.enqueue(MockResponse().setHeader("Content-Type", "text/event-stream").setBody(
+                "data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n"
+            ))
+            val error = runCatching {
+                testClient(server).chatWithTools("system", emptyList(), emptyList(), "available", null)
+            }.exceptionOrNull()
+            assertThat(error).isNotNull()
+            assertThat(error!!.message).contains("max_output_tokens")
+        } finally { server.shutdown() }
     }
 
     @Test
@@ -141,13 +204,13 @@ class CodexResponseClientTest {
     }
 
     @Test
-    fun `401 maps to IllegalStateException mentioning token`() {
+    fun `401 maps to IllegalStateException requesting sign in`() {
         val client = CodexResponseClient(supplier)
         val response = mockResponse(401, """{"error":{"message":"bad token"}}""")
         val ex = runCatching { invokeHandleErrorResponse(client, response) }.exceptionOrNull()
 
         assertThat(ex).isInstanceOf(IllegalStateException::class.java)
-        assertThat(ex!!.message).contains("Token rejected")
+        assertThat(ex!!.message).contains("Sign in again")
     }
 
     @Test(expected = TransientException::class)
@@ -242,4 +305,21 @@ class CodexResponseClientTest {
             .message("test")
             .body(body.toResponseBody("application/json".toMediaType()))
             .build()
+
+    private fun testClient(server: MockWebServer): CodexResponseClient {
+        val http = OkHttpClient.Builder().followRedirects(false).followSslRedirects(false).build()
+        return CodexResponseClient(
+            headerSupplier = supplier,
+            modelResolver = CodexModelResolver(
+                clientVersion = "1.2.3",
+                httpClient = http,
+                modelsUrl = server.url("/backend-api/codex/models").toString().removeSuffix("/"),
+            ),
+            httpClient = http,
+            responseUrl = server.url("/backend-api/codex/responses").toString(),
+        )
+    }
+
+    private fun completedSse() = "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\"}}\n\n" +
+        "data: {\"type\":\"response.completed\"}\n\n"
 }

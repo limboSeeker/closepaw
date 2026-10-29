@@ -43,6 +43,22 @@ class MainActivityModelValidationTest {
     }
 
     @Test
+    fun `cold start OAuth selection uses sign-in credentials before validation`() {
+        val seedCatalog = ModelCatalog.fromJson(
+            """{"codex-auto":{"display_name":"ChatGPT automatic","provider":"OPENAI_CODEX","api":"response","model_id":"codex-auto"}}"""
+        )
+        val signedIn = emptyAuthStore()
+        every { signedIn.has(LLMProvider.OPENAI_CODEX) } returns true
+        for (name in listOf("codex-account:retired", "gpt-5.2-codex", "gpt-5.4-codex", "gpt-5.5-codex")) {
+            val missing = findMissingCloudKeys(settings(mainModel = name), seedCatalog, emptyAuthStore())
+            assertThat(missing).hasSize(1)
+            assertThat(missing.single().provider).isEqualTo(LLMProvider.OPENAI_CODEX)
+            assertThat(missing.single().message).contains("ChatGPT sign-in required")
+            assertThat(findMissingCloudKeys(settings(mainModel = name), seedCatalog, signedIn)).isEmpty()
+        }
+    }
+
+    @Test
     fun `returns empty when local backend selected`() {
         val missing = findMissingCloudKeys(
             settings(backend = LLMBackendType.LOCAL),

@@ -106,7 +106,9 @@ class CodexSseParserTest {
     fun `response_incomplete maps to Failed with reason`() {
         // Fixed: response.incomplete is no longer treated as success.
         val event = sseEvent("response.incomplete", JSONObject().apply {
-            put("response", JSONObject().put("incomplete_reason", "max_output_tokens"))
+            put("response", JSONObject().put(
+                "incomplete_details", JSONObject().put("reason", "max_output_tokens")
+            ))
         })
         val accumulator = CodexSseParser.ToolCallAccumulator()
         val result = CodexSseParser.mapToStreamEvent(event, accumulator)

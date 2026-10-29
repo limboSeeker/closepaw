@@ -2,6 +2,7 @@ package ai.closepaw.llm
 
 import android.content.Context
 import android.util.Log
+import ai.closepaw.auth.CodexHeaders
 import ai.closepaw.app.AppSettingsStore
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -35,7 +36,10 @@ class ModelCatalogRepository(
     private val discoverFn: suspend (LLMProvider, String, String) -> List<DiscoveredModel> =
         ModelDiscovery::discover,
     private val clock: () -> Long = System::currentTimeMillis,
+    private val codexResolver: CodexModelResolver = CodexModelResolver(),
 ) {
+    @Volatile private var codexModels: List<CodexAccountModel> = emptyList()
+    private val codexRefreshGeneration = java.util.concurrent.atomic.AtomicLong()
     private val _catalog: MutableStateFlow<ModelCatalog> = MutableStateFlow(load())
     val catalog: StateFlow<ModelCatalog> = _catalog.asStateFlow()
 
@@ -55,6 +59,45 @@ class ModelCatalogRepository(
         _catalog.value = load()
         val freshTimestamps = readLastFetchedAt()
         _discoveryState.update { it.copy(lastFetchedAt = freshTimestamps) }
+    }
+
+    /** Refresh the signed-in account catalog. This data is deliberately memory-only. */
+    suspend fun refreshCodex(headers: CodexHeaders, forceRefresh: Boolean = true) {
+        val provider = LLMProvider.OPENAI_CODEX
+        val generation = codexRefreshGeneration.incrementAndGet()
+        updateDiscoveryState { it.withRefreshing(provider, true) }
+        try {
+            val models = codexResolver.listModels(headers, forceRefresh)
+            if (codexRefreshGeneration.get() != generation) return
+            codexModels = models
+            _catalog.value = load()
+            updateDiscoveryState { it.withRefreshing(provider, false).withSuccess(provider, clock()) }
+        } catch (e: Exception) {
+            if (codexRefreshGeneration.get() != generation) return
+            codexModels = emptyList()
+            _catalog.value = load()
+            updateDiscoveryState {
+                it.withRefreshing(provider, false).withError(provider, e.message ?: "Could not refresh ChatGPT models.")
+            }
+        }
+    }
+
+    suspend fun clearCodexModels() {
+        codexRefreshGeneration.incrementAndGet()
+        codexModels = emptyList()
+        codexResolver.clearMemoryCache()
+        _catalog.value = load()
+        updateDiscoveryState {
+            it.withRefreshing(LLMProvider.OPENAI_CODEX, false)
+                .copy(lastError = it.lastError - LLMProvider.OPENAI_CODEX)
+        }
+    }
+
+    fun reportCodexError(message: String) {
+        updateDiscoveryState {
+            it.withRefreshing(LLMProvider.OPENAI_CODEX, false)
+                .withError(LLMProvider.OPENAI_CODEX, message)
+        }
     }
 
     /**
@@ -156,6 +199,17 @@ class ModelCatalogRepository(
         val extras = buildList {
             synthOtherEntry()?.let { add(it) }
             addAll(discoveredEntriesScopedByCurrentBaseUrl())
+            addAll(codexModels.map { model ->
+                ModelEntry(
+                    name = CodexModelResolver.CATALOG_PREFIX + model.slug,
+                    displayName = model.displayName,
+                    provider = LLMProvider.OPENAI_CODEX,
+                    api = ApiType.RESPONSE,
+                    modelId = model.slug,
+                    contextWindow = model.contextWindow,
+                    supportsVision = model.supportsVision,
+                )
+            })
         }
         return if (extras.isEmpty()) seed else seed.withExtraEntries(extras)
     }

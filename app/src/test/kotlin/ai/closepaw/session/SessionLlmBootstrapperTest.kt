@@ -22,6 +22,37 @@ import org.junit.Test
 class SessionLlmBootstrapperTest {
 
     @Test
+    fun `cold start OAuth selection resolves before session credential check and client creation`() {
+        mockkStatic(Looper::class)
+        try {
+            every { Looper.getMainLooper() } returns null
+            val catalog = ModelCatalog.fromJson(
+                """{"codex-auto":{"display_name":"ChatGPT automatic","provider":"OPENAI_CODEX","api":"response","model_id":"codex-auto"}}"""
+            )
+            val repo = mockk<ModelCatalogRepository>(relaxed = true)
+            every { repo.catalog } returns MutableStateFlow(catalog)
+            val authStore = mockk<AuthStore>(relaxed = true)
+            for (name in listOf("codex-account:retired", "gpt-5.2-codex", "gpt-5.4-codex", "gpt-5.5-codex")) {
+                val config = SessionConfig(
+                    llm = SessionLlmConfig(backendType = LLMBackendType.OPENAI),
+                    mainModel = name,
+                )
+                every { authStore.has(LLMProvider.OPENAI_CODEX) } returns false
+                val error = assertThrows(MissingCredential::class.java) {
+                    SessionLlmBootstrapper.create(config, repo, mockk(relaxed = true), authStore)
+                }
+                assertThat(error.provider).isEqualTo(LLMProvider.OPENAI_CODEX)
+                every { authStore.has(LLMProvider.OPENAI_CODEX) } returns true
+                val bootstrap = SessionLlmBootstrapper.create(config, repo, mockk(relaxed = true), authStore)
+                assertThat(bootstrap.llmClient).isInstanceOf(ai.closepaw.llm.CodexResponseClient::class.java)
+                assertThat(bootstrap.modelCatalog.resolve(name).modelId).isEqualTo("codex-auto")
+            }
+        } finally {
+            unmockkStatic(Looper::class)
+        }
+    }
+
+    @Test
     fun `create throws when called on main thread`() {
         val mainLooper = mockk<Looper>()
         mockkStatic(Looper::class)

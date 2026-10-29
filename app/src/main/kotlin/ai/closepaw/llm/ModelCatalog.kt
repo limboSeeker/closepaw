@@ -76,13 +76,26 @@ class ModelCatalog private constructor(private val entries: Map<String, ModelEnt
      * @throws IllegalArgumentException if the name is not in the catalog.
      */
     fun resolve(name: String): ModelEntry =
-            entries[name]
+            resolveOrNull(name)
                     ?: throw IllegalArgumentException(
                             "Unknown model '$name'. Available: ${entries.keys.sorted()}"
                     )
 
-    /** Resolve a model by name, returning null if not found. */
-    fun resolveOrNull(name: String): ModelEntry? = entries[name]
+    /**
+     * Resolve without advertising stale OAuth choices as available models. Account-discovered
+     * entries are memory-only, so persisted keys can outlive them (or the retired seed rows).
+     * Route only those missing OAuth keys to the automatic seed; the Codex client discovers
+     * current account entitlements before inference. Exact catalog entries always win.
+     */
+    fun resolveOrNull(name: String): ModelEntry? {
+        entries[name]?.let { return it }
+        val isSavedOAuthKey =
+                (name.startsWith("codex-account:") && name.removePrefix("codex-account:").isNotBlank()) ||
+                        RETIRED_CODEX_KEY.matches(name)
+        return if (isSavedOAuthKey) {
+            entries["codex-auto"]?.takeIf { it.provider == LLMProvider.OPENAI_CODEX }
+        } else null
+    }
 
     /** All entries, in insertion order. */
     fun all(): List<ModelEntry> = entries.values.toList()
@@ -151,6 +164,7 @@ class ModelCatalog private constructor(private val entries: Map<String, ModelEnt
     }
 
     companion object {
+        private val RETIRED_CODEX_KEY = Regex("""gpt-5\.[0-9]+-codex""")
         private val json = Json { ignoreUnknownKeys = true }
 
         /**

@@ -29,15 +29,29 @@ import java.util.concurrent.atomic.AtomicReference
  * responses from `chatgpt.com/backend-api/codex/responses`.
  */
 class CodexResponseClient(
-    private val headerSupplier: suspend () -> CodexHeaders
+    private val headerSupplier: suspend () -> CodexHeaders,
+    private val modelResolver: CodexModelResolver = CodexModelResolver(),
+    private val httpClient: OkHttpClient = buildHttpClient(),
+    private val responseUrl: String = CODEX_URL,
 ) : LLMClient() {
 
     companion object {
         private const val TAG = "CodexResponseClient"
         private const val CODEX_URL = "https://chatgpt.com/backend-api/codex/responses"
-    }
 
-    private val httpClient: OkHttpClient = buildHttpClient()
+        private fun buildHttpClient(): OkHttpClient = OkHttpClient.Builder()
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(120, TimeUnit.SECONDS)
+            .writeTimeout(30, TimeUnit.SECONDS)
+            .apply {
+                val sf = InsecureSslConfig.sslSocketFactory
+                val tm = InsecureSslConfig.trustManager
+                if (sf != null && tm != null) sslSocketFactory(sf, tm)
+            }
+            .build()
+    }
 
     // ── Non-streaming ────────────────────────────────────────────────────
 
@@ -52,12 +66,22 @@ class CodexResponseClient(
         // Accept the parameter to satisfy the LLMClient contract, but cannot
         // forward it to the wire format.
         LlmLogger.logInput(TAG, systemPrompt, inputItems, tools)
+        var unsupportedRefreshUsed = false
 
         CloudLlmRetry.executeWithRetry(tag = TAG, operationName = "codex chatWithTools") {
-            val body = CodexRequestBuilder.buildRequestBody(systemPrompt, inputItems, tools, model)
-            val request = buildRequest(body, headerSupplier())
-
-            httpClient.newCall(request).execute().use { response ->
+            val headers = headerSupplier()
+            var resolvedModel = modelResolver.resolve(model, headers)
+            // One initial request and at most one unsupported-model refresh.
+            for (modelAttempt in 0..1) {
+                val request = buildRequest(buildBody(systemPrompt, inputItems, tools, resolvedModel), headers)
+                val response = httpClient.newCall(request).execute()
+                if (isUnsupportedModel(response) && !unsupportedRefreshUsed) {
+                    response.close()
+                    resolvedModel = modelResolver.resolve(model, headers, forceRefresh = true)
+                    unsupportedRefreshUsed = true
+                    continue
+                }
+                response.use {
                 if (!response.isSuccessful) handleErrorResponse(response)
 
                 val stream = response.body.byteStream()
@@ -95,7 +119,10 @@ class CodexResponseClient(
                         }
                         "response.incomplete" -> {
                             val reason = event.json.optJSONObject("response")
-                                ?.optString("incomplete_reason", "unknown") ?: "unknown"
+                                ?.let { value ->
+                                    value.optJSONObject("incomplete_details")?.optString("reason")
+                                        ?: value.optString("incomplete_reason", "unknown")
+                                } ?: "unknown"
                             throw RuntimeException("Codex response incomplete: $reason")
                         }
                         "response.failed" -> {
@@ -122,8 +149,10 @@ class CodexResponseClient(
                     responseId = responseId
                 )
                 LlmLogger.logOutput(TAG, result)
-                result
+                return@executeWithRetry result
+                }
             }
+            error("Codex model retry exhausted")
         }
     }
 
@@ -141,18 +170,26 @@ class CodexResponseClient(
         val activeCall = AtomicReference<okhttp3.Call?>(null)
 
         val job = launch {
+            var unsupportedRefreshUsed = false
             val retryResult = streamWithRetry(
                 tag = TAG,
                 emitToFlow = { event -> trySend(event) }
             ) { attempt, emitter ->
-                val body = CodexRequestBuilder.buildRequestBody(systemPrompt, inputItems, tools, model)
-                val request = buildRequest(body, headerSupplier())
+                val headers = headerSupplier()
+                var resolvedModel = modelResolver.resolve(model, headers)
 
                 withContext(Dispatchers.IO) {
-                    val call = httpClient.newCall(request)
-                    activeCall.set(call)
-                    try {
-                        call.execute().use { response ->
+                    while (true) {
+                        val body = buildBody(systemPrompt, inputItems, tools, resolvedModel)
+                        val call = httpClient.newCall(buildRequest(body, headers))
+                        activeCall.set(call)
+                        try {
+                            call.execute().use { response ->
+                                if (isUnsupportedModel(response) && !unsupportedRefreshUsed) {
+                                    resolvedModel = modelResolver.resolve(model, headers, forceRefresh = true)
+                                    unsupportedRefreshUsed = true
+                                    return@use
+                                }
                             if (!response.isSuccessful) handleErrorResponse(response)
 
                             val stream = response.body.byteStream()
@@ -191,9 +228,11 @@ class CodexResponseClient(
                             }
 
                             if (!sawCompletion) throw TransientException("Stream ended without completion event")
+                            return@withContext
+                            }
+                        } finally {
+                            activeCall.set(null)
                         }
-                    } finally {
-                        activeCall.set(null)
                     }
                 }
 
@@ -228,30 +267,43 @@ class CodexResponseClient(
     /** MediaType without charset — ChatGPT backend rejects `charset=utf-8`. */
     private fun buildRequest(body: String, headers: CodexHeaders): Request {
         val builder = Request.Builder()
-            .url(CODEX_URL)
+            .url(responseUrl)
             .post(body.toRequestBody(null)) // no media type on body
             .header("Content-Type", "application/json") // set header directly
             .header("Authorization", "Bearer ${headers.accessToken}")
-            .header("originator", "pi")
+            .header("originator", CodexProtocolIdentity.ORIGINATOR)
+            .header("version", CodexProtocolIdentity.COMPATIBILITY_VERSION)
             .header("OpenAI-Beta", "responses=experimental")
             .header("Accept", "text/event-stream")
         headers.chatgptAccountId?.let { builder.header("chatgpt-account-id", it) }
         return builder.build()
     }
 
-    private fun buildHttpClient(): OkHttpClient =
-        OkHttpClient.Builder()
-            .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(120, TimeUnit.SECONDS)
-            .writeTimeout(30, TimeUnit.SECONDS)
-            .apply {
-                val sf = InsecureSslConfig.sslSocketFactory
-                val tm = InsecureSslConfig.trustManager
-                if (sf != null && tm != null) {
-                    sslSocketFactory(sf, tm)
-                }
-            }
-            .build()
+    private fun buildBody(
+        systemPrompt: String,
+        inputItems: List<ResponseInputItem>,
+        tools: List<FunctionTool>,
+        model: CodexAccountModel,
+    ): String {
+        val body = CodexRequestBuilder.buildRequestBody(
+            systemPrompt, inputItems, tools, model.slug, model.supportsParallelToolCalls
+        )
+        if (!model.supportsVision && body.contains("\"input_image\"")) {
+            throw IllegalArgumentException("The selected ChatGPT model does not accept image input.")
+        }
+        return body
+    }
+
+    private fun isUnsupportedModel(response: okhttp3.Response): Boolean {
+        if (response.code != 400) return false
+        val peek = response.peekBody(64 * 1024).string()
+        val error = runCatching { JSONObject(peek).optJSONObject("error") }.getOrNull()
+        val code = error?.optString("code", "").orEmpty().lowercase()
+        val message = error?.optString("message", peek).orEmpty().lowercase()
+        return code.contains("unsupported_model") || code.contains("model_not_found") ||
+            (message.contains("model") && (message.contains("unsupported") ||
+                message.contains("not supported") || message.contains("not found")))
+    }
 
     private fun handleErrorResponse(response: okhttp3.Response): Nothing {
         val body = response.body.string()
@@ -276,8 +328,10 @@ class CodexResponseClient(
                 }
                 throw RateLimitException(friendly)
             }
-            status == 401 || status == 403 ->
-                throw IllegalStateException("Token rejected: $message")
+            status == 401 ->
+                throw IllegalStateException("ChatGPT sign-in expired or was rejected. Sign in again: $message")
+            status == 403 ->
+                throw IllegalStateException("ChatGPT account is not permitted to use this model: $message")
             status in 500..599 ->
                 throw TransientException("Server error: HTTP $status", null)
             else ->

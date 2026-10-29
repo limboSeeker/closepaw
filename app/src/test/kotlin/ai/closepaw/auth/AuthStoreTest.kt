@@ -165,6 +165,33 @@ class AuthStoreTest {
     }
 
     @Test
+    fun `codexHeaders reads account id from nested access token claim`() = runBlocking {
+        val payload = java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(
+            """{"https://api.openai.com/auth":{"chatgpt_account_id":"acct-nested"}}"""
+                .toByteArray()
+        )
+        val store = newStore(now = { 0L })
+        store.set(
+            LLMProvider.OPENAI_CODEX,
+            AuthCredential.OAuth("x.$payload.y", "rt", 3_600_000, null, null),
+        )
+        assertThat(store.codexHeaders(LLMProvider.OPENAI_CODEX).chatgptAccountId)
+            .isEqualTo("acct-nested")
+    }
+
+    @Test
+    fun `old API style Codex token requires actionable re-sign-in`() = runBlocking {
+        val store = newStore(now = { 0L })
+        store.set(
+            LLMProvider.OPENAI_CODEX,
+            AuthCredential.OAuth("sk-old-api-style", "rt", 3_600_000, null, null),
+        )
+        val error = runCatching { store.codexHeaders(LLMProvider.OPENAI_CODEX) }.exceptionOrNull()
+        assertThat(error).isInstanceOf(OAuthRefreshFailed::class.java)
+        assertThat(error!!.message).contains("Sign out, then sign in again")
+    }
+
+    @Test
     fun `codexHeaders refreshes when near expiry`() = runBlocking {
         val now = 1_000_000L
         val refreshCalls = AtomicInteger(0)
@@ -198,6 +225,23 @@ class AuthStoreTest {
         assertThat(refreshCalls.get()).isEqualTo(1)
         assertThat((store.get(provider) as AuthCredential.OAuth).accessToken)
             .isEqualTo("at-new")
+    }
+
+    @Test
+    fun `refresh rotation preserves omitted refresh and id tokens`() = runBlocking {
+        val now = 1_000_000L
+        val store = newStore(now = { now }, refresher = {
+            AuthCredential.OAuth("new-access", "", now + 3_600_000, null, null)
+        })
+        val provider = LLMProvider.OPENAI_API
+        store.set(provider, AuthCredential.OAuth("old-access", "old-refresh", now + 1, "old@example.com", "old-id"))
+
+        store.codexHeaders(provider)
+
+        val saved = store.get(provider) as AuthCredential.OAuth
+        assertThat(saved.refreshToken).isEqualTo("old-refresh")
+        assertThat(saved.idToken).isEqualTo("old-id")
+        assertThat(saved.email).isEqualTo("old@example.com")
     }
 
     @Test

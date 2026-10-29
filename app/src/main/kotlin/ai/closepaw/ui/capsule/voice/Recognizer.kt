@@ -65,7 +65,7 @@ interface RecognizerFactory {
 }
 
 /**
- * Production [RecognizerFactory] backed by [android.speech.SpeechRecognizer].
+ * Production [RecognizerFactory] backed only by on-device speech recognition; no cloud fallback.
  *
  * Holds an Application context (the caller should pass `context.applicationContext`); the
  * framework recognizer itself must be created on the main thread, so the controller — not this
@@ -73,7 +73,7 @@ interface RecognizerFactory {
  */
 class AndroidRecognizerFactory(private val context: Context) : RecognizerFactory {
     override fun isAvailable(): Boolean =
-        SpeechRecognizer.isRecognitionAvailable(context)
+        SpeechRecognizer.isOnDeviceRecognitionAvailable(context)
 
     override fun create(): Recognizer? =
         if (isAvailable()) AndroidRecognizer(context) else null
@@ -89,12 +89,12 @@ class AndroidRecognizerFactory(private val context: Context) : RecognizerFactory
  * if there is anything to transcribe); [cancel] aborts without delivering a result; [destroy]
  * detaches the listener and releases the framework recognizer — call exactly once.
  *
- * Must be constructed on the main thread because `SpeechRecognizer.createSpeechRecognizer` is
+ * Must be constructed on the main thread because `SpeechRecognizer.createOnDeviceSpeechRecognizer` is
  * documented to require the main thread.
  */
 internal class AndroidRecognizer(context: Context) : Recognizer {
     private val recognizer: SpeechRecognizer =
-        SpeechRecognizer.createSpeechRecognizer(context)
+        SpeechRecognizer.createOnDeviceSpeechRecognizer(context)
 
     private var callbacks: RecognizerCallbacks? = null
 
@@ -107,6 +107,7 @@ internal class AndroidRecognizer(context: Context) : Recognizer {
                 RecognizerIntent.LANGUAGE_MODEL_FREE_FORM,
             )
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, languageTag)
         }
         recognizer.startListening(intent)

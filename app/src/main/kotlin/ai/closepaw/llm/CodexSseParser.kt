@@ -98,7 +98,10 @@ object CodexSseParser {
         "response.incomplete" -> {
             val reason = event.json
                 .optJSONObject("response")
-                ?.optString("incomplete_reason", "unknown")
+                ?.let { response ->
+                    response.optJSONObject("incomplete_details")?.optString("reason")
+                        ?: response.optString("incomplete_reason", "unknown")
+                }
                 ?: "unknown"
             LLMStreamEvent.Failed("Response incomplete: $reason")
         }

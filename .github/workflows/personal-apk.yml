@@ -48,6 +48,7 @@ jobs:
           "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --verbose --print-certs dist/ClosePaw-ChatGPT-signed.apk | tee dist/signature.txt
           "$ANDROID_HOME/build-tools/36.0.0/zipalign" -c -P 16 -v 4 dist/ClosePaw-ChatGPT-signed.apk > dist/zipalign.txt
           "$ANDROID_HOME/build-tools/36.0.0/aapt" dump badging dist/ClosePaw-ChatGPT-signed.apk > dist/apk-info.txt
+          "$ANDROID_HOME/build-tools/36.0.0/aapt" dump xmltree dist/ClosePaw-ChatGPT-signed.apk AndroidManifest.xml > dist/manifest.txt
           sha256sum dist/ClosePaw-ChatGPT-signed.apk > dist/SHA256SUMS
           printf '%s\n' "$GITHUB_SHA" > dist/source-commit.txt
       - name: Upload verified signed APK
@@ -62,7 +63,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: unit-test-reports
-          path: app/build/reports/tests/testDebugUnitTest/
+          path: |
+            app/build/reports/tests/testDebugUnitTest/
+            app/build/test-results/testDebugUnitTest/*.xml
           if-no-files-found: ignore
           retention-days: 14
       - name: Remove runner signing key

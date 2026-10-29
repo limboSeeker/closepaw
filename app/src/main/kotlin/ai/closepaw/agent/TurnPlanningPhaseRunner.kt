@@ -183,7 +183,6 @@ internal class TurnPlanningPhaseRunner(
                 streamError?.let { throw it }
                 val result = turnResult ?: throw RuntimeException("Stream completed without result")
 
-                Log.d(TAG, "Turn $turnNumber: LLM response: ${result.content?.take(200)}...")
                 Log.d(TAG, "Turn $turnNumber: Tool calls: ${result.toolCalls.map { it.name }}")
 
                 trace.llmResponse(turnId, turnNumber, result)

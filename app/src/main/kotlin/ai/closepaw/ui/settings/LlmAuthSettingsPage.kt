@@ -40,6 +40,7 @@ import ai.closepaw.llm.ModelCatalog
 import ai.closepaw.llm.ModelCatalogRepository
 import ai.closepaw.llm.ModelCatalogRepositoryHolder
 import ai.closepaw.llm.ModelIdValidator
+import ai.closepaw.llm.CodexModelResolver
 import ai.closepaw.llm.OtherBaseUrlValidator
 import ai.closepaw.llm.displayLabel
 import ai.closepaw.protocol.LLMBackendType
@@ -208,10 +209,14 @@ internal fun LlmAuthSettingsPage(
                     onModelChange = { commitSignIn { onModelChange(it) } },
                     modelCatalog = modelCatalog,
                     openAiAuthUiState = openAiAuthUiState,
+                    authStore = authStore,
                     onStartOAuth = { commitSignIn { onStartOAuth() } },
                     onCancelOAuth = onCancelOAuth,
                     onSignOut = {
-                        scope.launch { authStore.clear(LLMProvider.OPENAI_CODEX) }
+                        scope.launch {
+                            authStore.clear(LLMProvider.OPENAI_CODEX)
+                            ModelCatalogRepositoryHolder.get(context).clearCodexModels()
+                        }
                         onSignOut()
                     }
                 )
@@ -329,20 +334,61 @@ private fun SignInTabContent(
     onModelChange: (String) -> Unit,
     modelCatalog: ModelCatalog,
     openAiAuthUiState: OpenAiAuthUiState,
+    authStore: AuthStore,
     onStartOAuth: () -> Unit,
     onCancelOAuth: () -> Unit,
     onSignOut: () -> Unit
 ) {
     // Canonical provider for this tab: selected model if OAuth-mode, else OPENAI_CODEX.
     val provider = resolveProviderForTab(LlmAuthTab.SIGN_IN, selectedModel, modelCatalog)
-    val modelOptions = catalogModelOptions(modelCatalog.modelsFor(provider))
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val repo = remember(context) { ModelCatalogRepositoryHolder.get(context) }
+    val discoveryState by repo.discoveryState.collectAsStateWithLifecycle()
+    val discovered = modelCatalog.modelsFor(provider)
+        .filter { it.name.startsWith(CodexModelResolver.CATALOG_PREFIX) }
+    val modelOptions = catalogModelOptions(discovered)
+    val signedIn = openAiAuthUiState is OpenAiAuthUiState.SignedIn
+
+    LaunchedEffect(modelOptions, selectedModel, signedIn) {
+        if (signedIn && modelOptions.isNotEmpty() && modelOptions.none { it.first == selectedModel }) {
+            onModelChange(modelOptions.first().first)
+        }
+    }
+
+    fun refresh() {
+        scope.launch {
+            runCatching { authStore.codexHeaders(LLMProvider.OPENAI_CODEX) }
+                .onSuccess { repo.refreshCodex(it, forceRefresh = true) }
+                .onFailure {
+                    repo.clearCodexModels()
+                    repo.reportCodexError("Could not read ChatGPT sign-in. Sign out, then sign in again.")
+                }
+        }
+    }
+    LaunchedEffect(signedIn) { if (signedIn) refresh() }
 
     SettingsSection(title = "Cloud Model") {
-        CloudModelDropdown(
-            selectedModel = selectedModel,
-            modelOptions = modelOptions,
-            onModelChange = onModelChange
-        )
+        if (modelOptions.isNotEmpty()) {
+            CloudModelDropdown(
+                selectedModel = selectedModel,
+                modelOptions = modelOptions,
+                onModelChange = onModelChange
+            )
+        } else {
+            Text(
+                if (signedIn) "No account models loaded. Tap Refresh models."
+                else "Sign in to load the models available to your ChatGPT account.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        TextButton(
+            onClick = { refresh() },
+            enabled = signedIn && provider !in discoveryState.refreshing,
+        ) { Text(if (provider in discoveryState.refreshing) "Refreshing…" else "Refresh models") }
+        discoveryState.lastError[provider]?.let { error ->
+            Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+        }
     }
     Spacer(modifier = Modifier.height(20.dp))
     SettingsSection(title = "Authentication") {
